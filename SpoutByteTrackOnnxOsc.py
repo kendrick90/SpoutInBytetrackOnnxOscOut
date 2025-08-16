@@ -2,6 +2,7 @@ import os
 import copy
 import time
 import argparse
+import logging
 
 import cv2
 
@@ -16,6 +17,13 @@ import array
 
 from byte_tracker.byte_tracker_onnx import ByteTrackerONNX
 
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 UDP_IP = "127.0.0.1"
 UDP_PORT = 7000
 
@@ -28,7 +36,7 @@ def get_args():
     parser.add_argument(
         '--model',
         type=str,
-        default='models/bytetrack/bytetrack_s_mot17_384x640.onnx',
+        default='byte_tracker/model/bytetrack_s.onnx',
     )
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument("--width", help='cap width', type=int, default=960)
@@ -95,15 +103,25 @@ def get_args():
 def main():
     # 引数取得
     args = get_args()
+    
+    logger.info("=" * 60)
+    logger.info("Starting SpoutIn ByteTrack ONNX OSC Out")
+    logger.info(f"Model: {args.model}")
+    logger.info(f"OSC Target: {UDP_IP}:{UDP_PORT}")
+    logger.info(f"Spout Sender Name: {SENDER_NAME}")
+    logger.info("=" * 60)
 
     # cap_device = args.device
     # cap_width = args.width
     # cap_height = args.height
 
+    logger.info(f"Initializing OSC client at {UDP_IP}:{UDP_PORT}")
     client = udp_client.SimpleUDPClient(UDP_IP, UDP_PORT)
 
     # ByteTrackerインスタンス生成
+    logger.info("Initializing ByteTracker with ONNX...")
     byte_tracker = ByteTrackerONNX(args)
+    logger.info("ByteTracker initialized successfully")
 
     # # カメラ準備
     # cap = cv2.VideoCapture(cap_device)
@@ -112,10 +130,24 @@ def main():
 
     frame_id = 1
 
+    # Create OpenCV window early
+    logger.info("Creating display window...")
+    cv2.namedWindow('Spout In ByteTrack ONNX OSC Out', cv2.WINDOW_NORMAL)
+    # Show a black placeholder image initially
+    placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+    cv2.putText(placeholder, f"Waiting for Spout sender: {SENDER_NAME}", (50, 240), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.imshow('Spout In ByteTrack ONNX OSC Out', placeholder)
+    cv2.waitKey(1)
+    
+    logger.info("Initializing Spout receiver...")
     with SpoutGL.SpoutReceiver() as receiver:
         receiver.setReceiverName(SENDER_NAME)
+        logger.info(f"Spout receiver created, waiting for sender: '{SENDER_NAME}'...")
 
         buffer = None
+        first_frame = True
+        no_input_logged = False
 
         while True:
             start_time = time.time()
@@ -133,8 +165,13 @@ def main():
                 width = receiver.getSenderWidth()
                 height = receiver.getSenderHeight()
                 buffer = array.array('B', repeat(0, width * height * 3))
+                logger.info(f"Spout sender detected! Size: {width}x{height}")
 
             if buffer and result and not SpoutGL.helpers.isBufferEmpty(buffer):
+                if first_frame:
+                    logger.info(f"First frame received! Processing at {width}x{height}")
+                    first_frame = False
+                    no_input_logged = False
                 # print("Got bytes", bytes(buffer[0:64]), "...")
 
                 frame = np.array(buffer)
@@ -146,6 +183,10 @@ def main():
                 _, bboxes, ids, scores = byte_tracker.inference(frame)
 
                 elapsed_time = time.time() - start_time
+
+                # Log detection info periodically
+                if frame_id % 30 == 0:  # Log every 30 frames
+                    logger.info(f"Frame {frame_id}: Detected {len(bboxes)} objects, inference time: {elapsed_time*1000:.2f}ms")
 
                 # 検出情報描画
                 debug_image = draw_tracking_info(
@@ -160,6 +201,7 @@ def main():
                 # キー処理(ESC：終了)
                 key = cv2.waitKey(1)
                 if key == 27:  # ESC
+                    logger.info("ESC pressed, shutting down...")
                     break
 
                 # 画面反映
@@ -173,12 +215,28 @@ def main():
                     bboxeslist.append(ids[i])
                     bboxeslist.append(scores[i])
                     
-                client.send_message('/bboxes', bboxeslist)
+                if len(bboxeslist) > 0:
+                    client.send_message('/bboxes', bboxeslist)
+                    if frame_id % 30 == 0:  # Log OSC messages periodically
+                        logger.debug(f"Sent OSC message with {len(bboxes)} detections")
 
                 rtime = (time.time() - start_time)*1000
-                print(f"total run time: {rtime:.2f} ms")
+                if frame_id % 30 == 0:
+                    logger.info(f"Total frame processing time: {rtime:.2f} ms")
 
                 receiver.waitFrameSync(SENDER_NAME, 10000)
+            else:
+                # No input received
+                if not no_input_logged:
+                    logger.warning(f"No Spout input received from '{SENDER_NAME}'. Please ensure TouchDesigner or another Spout sender is running.")
+                    logger.info("Waiting for Spout sender... (Press ESC in the window to exit)")
+                    no_input_logged = True
+                
+                # Still check for ESC key
+                key = cv2.waitKey(100)
+                if key == 27:  # ESC
+                    logger.info("ESC pressed, shutting down...")
+                    break
 
 
 def get_id_color(index):
