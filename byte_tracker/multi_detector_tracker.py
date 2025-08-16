@@ -9,6 +9,8 @@ import numpy as np
 from .tracker.byte_tracker import BYTETracker
 from .yolox_detector import YOLOXDetector, YOLODetector
 from .yolo_ir_detector import YOLOIRDetector, FLIRYOLODetector
+from .motion_detector import MotionDetector, AdaptiveMotionDetector
+from .simple_motion_detector import SimpleMotionDetector, HybridMotionDetector
 
 logger = logging.getLogger(__name__)
 
@@ -17,14 +19,43 @@ class MultiDetectorByteTracker:
     """ByteTracker with pluggable detection backends"""
     
     def __init__(self, args, detector_type='yolox', is_ir_mode=False, 
-                 ir_enhancement='clahe', frame_rate=30, use_ir_trained_model=False):
+                 ir_enhancement='clahe', frame_rate=30, use_ir_trained_model=False, debug_mode=False):
         self.args = args
         self.detector_type = detector_type
         self.is_ir_mode = is_ir_mode
         self.use_ir_trained_model = use_ir_trained_model
+        self.debug_mode = debug_mode
         
         # Initialize detector based on type
-        if detector_type == 'yolo_ir':
+        if detector_type == 'motion':
+            logger.info("Using Motion detector")
+            self.detector = MotionDetector(
+                min_area=getattr(args, 'min_area', 500),
+                max_area=getattr(args, 'max_area', 50000),
+                var_threshold=getattr(args, 'motion_threshold', 16)
+            )
+        elif detector_type == 'adaptive_motion':
+            logger.info("Using Adaptive Motion detector")
+            self.detector = AdaptiveMotionDetector(
+                min_area=getattr(args, 'min_area', 500),
+                max_area=getattr(args, 'max_area', 50000),
+                var_threshold=getattr(args, 'motion_threshold', 16)
+            )
+        elif detector_type == 'simple_motion':
+            logger.info("Using Simple Motion detector (frame differencing)")
+            self.detector = SimpleMotionDetector(
+                min_area=getattr(args, 'min_area', 300),
+                max_area=getattr(args, 'max_area', 50000),
+                diff_threshold=getattr(args, 'motion_threshold', 25)
+            )
+        elif detector_type == 'hybrid_motion':
+            logger.info("Using Hybrid Motion detector (BG subtraction + frame diff)")
+            self.detector = HybridMotionDetector(
+                min_area=getattr(args, 'min_area', 300),
+                max_area=getattr(args, 'max_area', 50000),
+                var_threshold=getattr(args, 'motion_threshold', 16)
+            )
+        elif detector_type == 'yolo_ir':
             # Use YOLO-IR detector for IR-trained models
             if 'flir' in args.model.lower():
                 logger.info("Using FLIR YOLO detector")
@@ -85,6 +116,13 @@ class MultiDetectorByteTracker:
         # Run detection
         detections = self.detector.detect(image)
         
+        # Debug logging for motion detectors
+        if self.detector_type in ['motion', 'adaptive_motion', 'simple_motion', 'hybrid_motion']:
+            if len(detections) > 0:
+                logger.debug(f"Motion detector found {len(detections)} detections")
+                for i, det in enumerate(detections[:3]):  # Log first 3
+                    logger.debug(f"  Detection {i}: bbox=({det[0]:.0f},{det[1]:.0f},{det[2]:.0f},{det[3]:.0f}) score={det[4]:.3f} class={det[5]}")
+        
         # Convert detections to tracker format
         if len(detections) > 0:
             # Format: [x1, y1, x2, y2, score]
@@ -92,19 +130,34 @@ class MultiDetectorByteTracker:
             det_scores = detections[:, 4]
             det_classes = detections[:, 5] if detections.shape[1] > 5 else None
             
-            # Filter for person class (class 0) if available
-            if det_classes is not None:
+            # For motion detectors, skip class filtering since all detections are relevant
+            if self.detector_type in ['motion', 'adaptive_motion', 'simple_motion', 'hybrid_motion']:
+                # Motion detectors: use all detections (they're already person-like blobs)
+                logger.debug(f"Motion detector: Using all {len(det_boxes)} detections")
+            elif det_classes is not None:
+                # YOLO detectors: filter for person class (class 0) only
                 person_mask = det_classes == 0  # Person class in COCO
                 det_boxes = det_boxes[person_mask]
                 det_scores = det_scores[person_mask]
+                logger.debug(f"YOLO detector: Filtered to {len(det_boxes)} person detections")
             
             # Combine boxes and scores for tracker format
             if len(det_boxes) > 0:
                 output_results = np.column_stack([det_boxes, det_scores])
+                logger.debug(f"Sending {len(output_results)} detections to tracker")
             else:
                 output_results = np.empty((0, 5))
+                logger.debug("No detections passed filtering")
         else:
             output_results = np.empty((0, 5))
+        
+        # Debug logging before tracker update
+        if self.debug_mode:
+            logger.debug(f"Pre-tracker: {len(output_results)} detections to ByteTracker")
+            if len(output_results) > 0:
+                logger.debug(f"  Score range: {output_results[:, 4].min():.3f} - {output_results[:, 4].max():.3f}")
+                logger.debug(f"  Track threshold: {self.args.track_thresh}")
+                logger.debug(f"  Min box area: {self.args.min_box_area}")
         
         # Update tracker
         online_targets = self.tracker.update(
@@ -113,20 +166,34 @@ class MultiDetectorByteTracker:
             img_size=[image.shape[0], image.shape[1]]
         )
         
+        # Debug logging after tracker update
+        if self.debug_mode:
+            logger.debug(f"Post-tracker: {len(online_targets)} tracks from ByteTracker")
+        
         # Extract tracking results
         online_tlwhs = []
         online_ids = []
         online_scores = []
         
+        filtered_count = 0
         for track in online_targets:
             tlwh = track.tlwh
             track_id = track.track_id
             score = track.score
+            area = tlwh[2] * tlwh[3]
             
-            if tlwh[2] * tlwh[3] > self.args.min_box_area:
+            if area > self.args.min_box_area:
                 online_tlwhs.append(tlwh)
                 online_ids.append(track_id)
                 online_scores.append(score)
+            else:
+                filtered_count += 1
+                if self.debug_mode:
+                    logger.debug(f"  Filtered track {track_id}: area={area:.1f} < {self.args.min_box_area}")
+        
+        if self.debug_mode and filtered_count > 0:
+            logger.debug(f"Final filtering: {filtered_count} tracks removed by min_box_area")
+            logger.debug(f"Final result: {len(online_tlwhs)} tracks passed all filters")
         
         return image, online_tlwhs, online_ids, online_scores
     
@@ -150,7 +217,7 @@ class MultiDetectorByteTracker:
 
 
 def create_tracker_from_args(args, detector_type='auto', is_ir_mode=False, 
-                           ir_enhancement='clahe', use_ir_trained_model=False):
+                           ir_enhancement='clahe', use_ir_trained_model=False, debug_mode=False):
     """
     Factory function to create tracker with automatic detector type detection
     
@@ -166,7 +233,7 @@ def create_tracker_from_args(args, detector_type='auto', is_ir_mode=False,
     """
     if detector_type == 'auto':
         # Try to detect model type from filename
-        model_name = args.model.lower()
+        model_name = args.model.lower() if hasattr(args, 'model') and args.model else ''
         if any(keyword in model_name for keyword in ['flir', 'ir_', '_ir', 'thermal', 'infrared']):
             detector_type = 'yolo_ir'
             logger.info("Auto-detected IR-trained model")
@@ -179,9 +246,15 @@ def create_tracker_from_args(args, detector_type='auto', is_ir_mode=False,
         elif 'yolov5' in model_name:
             detector_type = 'yolov5'
         else:
-            # Default to YOLOX for compatibility
+            # Default to YOLOX for compatibility (unless motion is requested)
             detector_type = 'yolox'
-            logger.warning(f"Could not detect model type from {args.model}, defaulting to YOLOX")
+            if hasattr(args, 'model') and args.model:
+                logger.warning(f"Could not detect model type from {args.model}, defaulting to YOLOX")
+    
+    # Motion detectors don't need model files
+    if detector_type in ['motion', 'adaptive_motion', 'simple_motion', 'hybrid_motion']:
+        # Motion detection doesn't use model files
+        pass
     
     # Auto-detect if this is an IR-trained model
     model_name = args.model.lower()
@@ -196,10 +269,14 @@ def create_tracker_from_args(args, detector_type='auto', is_ir_mode=False,
     elif is_ir_mode:
         logger.info("Using RGB model with IR preprocessing")
     
+    if debug_mode:
+        logger.info("Debug mode enabled for tracker")
+    
     return MultiDetectorByteTracker(
         args=args,
         detector_type=detector_type,
         is_ir_mode=is_ir_mode,
         ir_enhancement=ir_enhancement,
-        use_ir_trained_model=use_ir_trained_model
+        use_ir_trained_model=use_ir_trained_model,
+        debug_mode=debug_mode
     )
