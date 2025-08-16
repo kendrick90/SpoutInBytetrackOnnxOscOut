@@ -16,6 +16,7 @@ from itertools import repeat
 import array
 
 from byte_tracker.byte_tracker_onnx import ByteTrackerONNX
+from byte_tracker.multi_detector_tracker import create_tracker_from_args
 
 # Set up logging
 logging.basicConfig(
@@ -95,6 +96,32 @@ def get_args():
         help='test mot20.',
     )
 
+    # IR camera support
+    parser.add_argument(
+        '--ir_mode',
+        action='store_true',
+        help='Enable IR camera mode with image enhancement',
+    )
+    parser.add_argument(
+        '--ir_enhancement',
+        type=str,
+        default='clahe',
+        choices=['histogram', 'clahe', 'gamma', 'none'],
+        help='IR image enhancement method',
+    )
+    parser.add_argument(
+        '--detector_type',
+        type=str,
+        default='auto',
+        choices=['auto', 'yolox', 'yolov5', 'yolov7', 'yolov8', 'yolo_ir'],
+        help='Detection model type',
+    )
+    parser.add_argument(
+        '--use_legacy_tracker',
+        action='store_true',
+        help='Use legacy ByteTrackerONNX instead of multi-detector',
+    )
+
     args = parser.parse_args()
 
     return args
@@ -107,6 +134,10 @@ def main():
     logger.info("=" * 60)
     logger.info("Starting SpoutIn ByteTrack ONNX OSC Out")
     logger.info(f"Model: {args.model}")
+    logger.info(f"Detector Type: {args.detector_type}")
+    logger.info(f"IR Mode: {args.ir_mode}")
+    if args.ir_mode:
+        logger.info(f"IR Enhancement: {args.ir_enhancement}")
     logger.info(f"OSC Target: {UDP_IP}:{UDP_PORT}")
     logger.info(f"Spout Sender Name: {SENDER_NAME}")
     logger.info("=" * 60)
@@ -119,8 +150,17 @@ def main():
     client = udp_client.SimpleUDPClient(UDP_IP, UDP_PORT)
 
     # ByteTrackerインスタンス生成
-    logger.info("Initializing ByteTracker with ONNX...")
-    byte_tracker = ByteTrackerONNX(args)
+    if args.use_legacy_tracker:
+        logger.info("Initializing legacy ByteTracker with ONNX...")
+        byte_tracker = ByteTrackerONNX(args)
+    else:
+        logger.info("Initializing multi-detector ByteTracker...")
+        byte_tracker = create_tracker_from_args(
+            args=args,
+            detector_type=args.detector_type,
+            is_ir_mode=args.ir_mode,
+            ir_enhancement=args.ir_enhancement if args.ir_enhancement != 'none' else None
+        )
     logger.info("ByteTracker initialized successfully")
 
     # # カメラ準備
