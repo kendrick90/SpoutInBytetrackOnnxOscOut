@@ -216,6 +216,9 @@ def main():
 
                 frame = np.array(buffer)
                 frame = np.reshape(frame, (height, width, 3))
+                
+                # Convert RGB to BGR for OpenCV
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
                 debug_image = copy.deepcopy(frame)
 
