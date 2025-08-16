@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 import copy
+import logging
 
 import numpy as np
 import onnxruntime
@@ -12,6 +13,8 @@ from byte_tracker.utils.yolox_utils import (
 )
 from byte_tracker.tracker.byte_tracker import BYTETracker
 
+logger = logging.getLogger(__name__)
+
 
 class ByteTrackerONNX(object):
     def __init__(self, args):
@@ -21,11 +24,31 @@ class ByteTrackerONNX(object):
         self.std = (0.229, 0.224, 0.225)
 
         # ByteTracker ONNX読み込み
+        logger.info(f"Loading ONNX model from: {args.model}")
         self.session = onnxruntime.InferenceSession(args.model,
                         providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-        self.input_shape = tuple(map(int, args.input_shape.split(',')))
+        
+        # Log which provider is actually being used
+        actual_providers = self.session.get_providers()
+        logger.info(f"ONNX Runtime using providers: {actual_providers}")
+        
+        # Auto-detect model input shape from ONNX model
+        model_inputs = self.session.get_inputs()
+        input_shape_from_model = model_inputs[0].shape
+        logger.info(f"Model expects input shape: {input_shape_from_model}")
+        
+        # If model has dynamic batch size (often -1 or 'N'), use shape from args or model
+        if input_shape_from_model[2] > 0 and input_shape_from_model[3] > 0:
+            # Use the model's expected input size
+            self.input_shape = (input_shape_from_model[2], input_shape_from_model[3])
+            logger.info(f"Using model's input shape: {self.input_shape}")
+        else:
+            # Fall back to command line args
+            self.input_shape = tuple(map(int, args.input_shape.split(',')))
+            logger.info(f"Using command line input shape: {self.input_shape}")
 
         # ByteTrackerインスタンス生成
+        logger.info("Initializing ByteTracker...")
         self.tracker = BYTETracker(args, frame_rate=30)
 
     def _pre_process(self, image):
