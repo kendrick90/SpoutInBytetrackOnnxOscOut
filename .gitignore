@@ -30,4 +30,7 @@ venv.bak/
 
 # OS
 Thumbs.db
-desktop.inivenv312/
+desktop.ini
+
+# Python virtual environments
+venv312/
